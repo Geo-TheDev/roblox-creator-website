@@ -10,6 +10,11 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/roblox/, ""),
       },
+      "/api/thumbnails": {
+        target: "https://thumbnails.roblox.com",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/thumbnails/, ""),
+      },
     },
   },
 });

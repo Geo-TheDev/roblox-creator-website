@@ -6,8 +6,30 @@ import path from "path";
 const app = express();
 const PORT = process.env.PORT || 3001;
 const ROBLOX_API = "https://apis.roblox.com";
+const THUMBNAILS_API = "https://thumbnails.roblox.com";
 
 app.use(cors());
+
+// Proxy /api/thumbnails/* to thumbnails.roblox.com
+app.all("/api/thumbnails/*", async (req, res) => {
+  const thumbPath = req.originalUrl.replace(/^\/api\/thumbnails/, "");
+  const targetUrl = `${THUMBNAILS_API}${thumbPath}`;
+
+  try {
+    const response = await fetch(targetUrl, { method: "GET" });
+    res.status(response.status);
+    response.headers.forEach((value, key) => {
+      if (key.toLowerCase() !== "transfer-encoding") {
+        res.setHeader(key, value);
+      }
+    });
+    const responseBody = await response.arrayBuffer();
+    res.send(Buffer.from(responseBody));
+  } catch (err) {
+    console.error("Thumbnails proxy error:", err);
+    res.status(502).json({ error: "Failed to proxy request to Roblox Thumbnails API" });
+  }
+});
 
 // Proxy all /api/roblox/* requests to the Roblox Open Cloud API.
 // We stream the request body directly so multipart/form-data passes through.

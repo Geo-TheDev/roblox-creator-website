@@ -27,42 +27,89 @@ function delay(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ── Icons ────────────────────────────────────────────────────────────────
+// ── Icons (Thumbnails API) ───────────────────────────────────────────────
 
-interface IconResponse {
-  data: { imageUrl?: string; languageCode?: string }[];
+interface ThumbnailResponse {
+  data: { targetId: number; state: string; imageUrl: string }[];
 }
 
-async function fetchGamePassIconUrl(
-  apiKey: string,
-  gamePassId: string
-): Promise<string | undefined> {
-  try {
-    const res = await robloxFetch(
-      apiKey,
-      `/legacy-game-internationalization/v1/game-passes/${gamePassId}/icons`
-    );
-    const data: IconResponse = await res.json();
-    return data.data?.[0]?.imageUrl ?? undefined;
-  } catch {
-    return undefined;
+async function fetchGamePassIcons(
+  ids: string[]
+): Promise<Map<string, string>> {
+  const iconMap = new Map<string, string>();
+  if (ids.length === 0) return iconMap;
+
+  // Batch in groups of 100 (API limit)
+  for (let i = 0; i < ids.length; i += 100) {
+    const batch = ids.slice(i, i + 100);
+    const params = new URLSearchParams({
+      gamePassIds: batch.join(","),
+      size: "150x150",
+      format: "Png",
+    });
+    try {
+      const res = await fetch(`/api/thumbnails/v1/game-passes?${params}`);
+      if (res.ok) {
+        const data: ThumbnailResponse = await res.json();
+        for (const item of data.data) {
+          if (item.state === "Completed" && item.imageUrl) {
+            iconMap.set(String(item.targetId), item.imageUrl);
+          }
+        }
+      }
+    } catch {
+      // Ignore icon fetch failures
+    }
+    if (i + 100 < ids.length) await delay(250);
   }
+  return iconMap;
 }
 
-async function fetchDevProductIconUrl(
-  apiKey: string,
-  devProductId: string
-): Promise<string | undefined> {
-  try {
-    const res = await robloxFetch(
-      apiKey,
-      `/legacy-game-internationalization/v1/developer-products/${devProductId}/icons`
-    );
-    const data: IconResponse = await res.json();
-    return data.data?.[0]?.imageUrl ?? undefined;
-  } catch {
-    return undefined;
+async function fetchDevProductIcons(
+  ids: string[],
+  iconImageAssetIds: (number | undefined)[]
+): Promise<Map<string, string>> {
+  const iconMap = new Map<string, string>();
+
+  // Build parallel arrays of valid (dpId, assetId) pairs
+  const validIds: string[] = [];
+  const validAssetIds: number[] = [];
+  for (let i = 0; i < ids.length; i++) {
+    if (iconImageAssetIds[i]) {
+      validIds.push(ids[i]);
+      validAssetIds.push(iconImageAssetIds[i]!);
+    }
   }
+  if (validAssetIds.length === 0) return iconMap;
+
+  // Use the assets thumbnail endpoint (dev-products/icons is unreliable)
+  for (let i = 0; i < validAssetIds.length; i += 100) {
+    const batchAssetIds = validAssetIds.slice(i, i + 100);
+    const batchDpIds = validIds.slice(i, i + 100);
+    const params = new URLSearchParams({
+      assetIds: batchAssetIds.join(","),
+      size: "150x150",
+      format: "Png",
+    });
+    try {
+      const res = await fetch(`/api/thumbnails/v1/assets?${params}`);
+      if (res.ok) {
+        const data: ThumbnailResponse = await res.json();
+        for (const item of data.data) {
+          if (item.state === "Completed" && item.imageUrl) {
+            const idx = batchAssetIds.indexOf(item.targetId);
+            if (idx !== -1) {
+              iconMap.set(batchDpIds[idx], item.imageUrl);
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore icon fetch failures
+    }
+    if (i + 100 < validAssetIds.length) await delay(250);
+  }
+  return iconMap;
 }
 
 // ── Game Passes ──────────────────────────────────────────────────────────
@@ -122,16 +169,10 @@ export async function listGamePasses(
     if (pageToken) await delay(250);
   } while (pageToken);
 
-  // Fetch icon URLs in parallel (batches of 5 to respect rate limits)
-  for (let i = 0; i < all.length; i += 5) {
-    const batch = all.slice(i, i + 5);
-    const urls = await Promise.all(
-      batch.map((gp) => fetchGamePassIconUrl(apiKey, gp.id))
-    );
-    urls.forEach((url, j) => {
-      all[i + j].iconUrl = url;
-    });
-    if (i + 5 < all.length) await delay(250);
+  // Fetch all icons in one batch call
+  const iconMap = await fetchGamePassIcons(all.map((gp) => gp.id));
+  for (const gp of all) {
+    gp.iconUrl = iconMap.get(gp.id);
   }
 
   return all;
@@ -208,7 +249,6 @@ interface ListDevProductsResponse {
 }
 
 interface RawDevProduct {
-  developerProductId: number;
   productId: number;
   name: string;
   description: string;
@@ -225,6 +265,7 @@ export async function listDeveloperProducts(
   universeId: string
 ): Promise<DeveloperProduct[]> {
   const all: DeveloperProduct[] = [];
+  const assetIds: (number | undefined)[] = [];
   let pageToken: string | undefined;
 
   do {
@@ -239,7 +280,7 @@ export async function listDeveloperProducts(
 
     for (const dp of data.developerProducts ?? []) {
       all.push({
-        id: String(dp.developerProductId),
+        id: String(dp.productId),
         name: dp.name,
         description: dp.description ?? "",
         price: dp.priceInformation?.defaultPriceInRobux ?? 0,
@@ -247,22 +288,17 @@ export async function listDeveloperProducts(
         isRegionalPricingEnabled: hasRegionalPricing(dp.priceInformation?.enabledFeatures),
         iconUrl: undefined,
       });
+      assetIds.push(dp.iconImageAssetId);
     }
 
     pageToken = data.nextPageToken;
     if (pageToken) await delay(150);
   } while (pageToken);
 
-  // Fetch icon URLs in parallel (batches of 5 to respect rate limits)
-  for (let i = 0; i < all.length; i += 5) {
-    const batch = all.slice(i, i + 5);
-    const urls = await Promise.all(
-      batch.map((dp) => fetchDevProductIconUrl(apiKey, dp.id))
-    );
-    urls.forEach((url, j) => {
-      all[i + j].iconUrl = url;
-    });
-    if (i + 5 < all.length) await delay(200);
+  // Fetch icons via assets thumbnail API (dev-products/icons endpoint is unreliable)
+  const iconMap = await fetchDevProductIcons(all.map((dp) => dp.id), assetIds);
+  for (const dp of all) {
+    dp.iconUrl = iconMap.get(dp.id);
   }
 
   return all;
@@ -296,7 +332,7 @@ export async function createDeveloperProduct(
   );
   const body: RawDevProduct = await res.json();
   return {
-    id: String(body.developerProductId),
+    id: String(body.productId),
     name: body.name,
     price: body.priceInformation?.defaultPriceInRobux ?? data.price,
   };
